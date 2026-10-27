@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>HALLS — Horror</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;overflow:hidden;background:#050609;color:white;font-family:Arial}
+canvas{display:block}
+#menu{position:fixed;inset:0;z-index:5;display:grid;place-items:center;background:radial-gradient(#28303b,#030407 75%);padding:18px}
+#panel{width:min(420px,100%);padding:25px;background:#0a1019;border:1px solid #414956;border-radius:18px;text-align:center}
+h1{font-size:38px;letter-spacing:5px;margin:0}
+p{color:#bfc6d0;line-height:1.5;font-size:14px}
+input{width:100%;padding:13px;margin:6px 0 12px;background:#05080d;color:white;border:1px solid #454b55;border-radius:9px;font-size:16px}
+button{padding:12px;background:#171d27;color:white;border:1px solid #646b76;border-radius:10px;font-weight:bold;touch-action:manipulation}
+.primary{background:#d4b65b;color:#17130a;border:0}
+.row{display:flex;gap:8px}.row button{flex:1}
+#hud{position:fixed;inset:0;pointer-events:none}
+#status,#help,#inventory{position:absolute;background:#000a;padding:9px 12px;border-radius:9px;font-size:12px}
+#status{top:12px;left:12px}
+#help{top:12px;right:12px;text-align:right}
+#inventory{bottom:14px;left:12px;max-width:65%}
+#message{position:absolute;top:23%;width:100%;text-align:center;font-weight:bold;font-size:clamp(22px,5vw,42px);text-shadow:0 3px 8px black;opacity:0;transition:opacity .2s}
+#interact{position:absolute;right:20px;bottom:24px;pointer-events:auto}
+#touch{display:none;position:fixed;inset:0;pointer-events:none}
+#stick{position:absolute;left:20px;bottom:22px;width:115px;height:115px;border-radius:50%;background:#ffffff18;border:2px solid #ffffff55;pointer-events:auto;touch-action:none}
+#nub{position:absolute;left:32px;top:32px;width:47px;height:47px;border-radius:50%;background:#ffffff85}
+#look{position:absolute;right:0;top:32%;width:52%;height:55%;pointer-events:auto;touch-action:none}
+#glitch{position:fixed;inset:0;z-index:4;pointer-events:none;opacity:0}
+#glitch.on{animation:glitch .8s steps(2)}
+@keyframes glitch{0%{opacity:0}20%{opacity:1;background:repeating-linear-gradient(0deg,#ff00ff44 0 3px,#00ffff33 4px 6px);transform:translateX(8px)}45%{opacity:.7;transform:translateX(-9px)}100%{opacity:0}}
+</style>
+</head>
+<body>
+<div id="menu">
+ <div id="panel">
+  <h1>HALLS</h1>
+  <div style="color:#d4b65b;letter-spacing:3px">CO-OP HORROR</div>
+  <p>Исследуй комнаты. Найди предметы. Не смотри на Глаза. Не отставай от друга.</p>
+  <label>Имя игрока</label>
+  <input id="name" maxlength="16" value="Player">
+  <label>Код комнаты — одинаковый у друзей</label>
+  <input id="room" maxlength="8" value="HALL">
+  <div class="row">
+   <button id="solo">Один игрок</button>
+   <button id="coop" class="primary">Играть вместе</button>
+  </div>
+  <p>Для совместной игры откройте один адрес на двух устройствах и введите одинаковый код.</p>
+ </div>
+</div>
+
+<div id="hud">
+ <div id="status">Дверь: <b id="doorNum">0</b> · HP: <b id="hp">100</b></div>
+ <div id="help">WASD — движение<br>Мышь — обзор<br>E — действие</div>
+ <div id="message"></div>
+ <div id="inventory">Предметы: <span id="items">пока пусто</span></div>
+ <button id="interact">E · Действие</button>
+</div>
+
+<div id="touch">
+ <div id="stick"><div id="nub"></div></div>
+ <div id="look"></div>
+</div>
+<div id="glitch"></div>
+
+<script type="module">
+import * as THREE from
+ 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
+
+const $ = id => document.getElementById(id);
+let scene, camera, renderer, socket;
+let playerId = null, state = null;
+let started = false, door = 0, health = 100;
+let roomCode = 'HALL', playerName = 'Player';
+let x = 0, z = 5, yaw = 0, pitch = 0;
+let forward = 0, sideways = 0, hiding = false;
+let inventory = [], transitioning = false, lastSent = 0;
+const others = new Map();
+let doorPanel, doorGroup, eyesGroup, seekGroup, figureGroup;
+let eventName = '', objectiveCount = 0;
+const world = new THREE.Group();
+
+function material(color, extra={}) {
+ return new THREE.MeshStandardMaterial({color, ...extra});
+}
+
+function box(w,h,d,color,px,py,pz,parent=world) {
+ const mesh = new THREE.Mesh(
+  new THREE.BoxGeometry(w,h,d), material(color)
+ );
+ mesh.position.set(px,py,pz);
+ mesh.castShadow = true;
+ mesh.receiveShadow = true;
+ parent.add(mesh);
+ return mesh;
+}
+
+function init() {
+ scene = new THREE.Scene();
+ scene.background = new THREE.Color(0x080a10);
+ scene.fog = new THREE.Fog(0x080a10, 9, 35);
+
+ camera = new THREE.PerspectiveCamera(
+  75, innerWidth/innerHeight, .1, 150
+ );
+ camera.rotation.order = 'YXZ';
+
+ renderer = new THREE.WebGLRenderer({antialias:true});
+ renderer.setSize(innerWidth,innerHeight);
+ renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));
+ renderer.shadowMap.enabled = true;
+ document.body.appendChild(renderer.domElement);
+
+ scene.add(new THREE.HemisphereLight(0x9cabc7,0x17110d,1.4));
+ const lamp = new THREE.PointLight(0xffd6a0,25,24);
+ lamp.position.set(0,3.5,0);
+ scene.add(lamp);
+ scene.add(world);
+
+ makeRoom(0);
+
+ addEventListener('resize',()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+ });
+
+ renderer.domElement.addEventListener('click',()=>{
+  if(started && !matchMedia('(pointer:coarse)').matches) {
+   renderer.domElement.requestPointerLock?.();
+  }
+ });
+
+ document.addEventListener('mousemove',e=>{
+  if(document.pointerLockElement === renderer.domElement) {
+   yaw -= e.movementX*.002;
+   pitch = Math.max(-1.15,Math.min(1.15,pitch-e.movementY*.002));
+  }
+ });
+
+ document.addEventListener('keydown',e=>{
+  if(['KeyW','ArrowUp'].includes(e.code)) forward=1;
+  if(['KeyS','ArrowDown'].includes(e.code)) forward=-1;
+  if(['KeyA','ArrowLeft'].includes(e.code)) sideways=-1;
+  if(['KeyD','ArrowRight'].includes(e.code)) sideways=1;
+  if(e.code==='KeyE' || e.code==='Space') interact();
+  if(e.code==='ShiftLeft') hiding=true;
+ });
+ document.addEventListener('keyup',e=>{
+  if(['KeyW','ArrowUp','KeyS','ArrowDown'].includes(e.code)) forward=0;
+  if(['KeyA','ArrowLeft','KeyD','ArrowRight'].includes(e.code)) sideways=0;
+  if(e.code==='ShiftLeft') hiding=false;
+ });
+
+ setupTouch();
+ animate();
+}
+
+function makeRoom(n) {
+ world.clear();
+ eyesGroup = seekGroup = figureGroup = null;
+ doorPanel = doorGroup = null;
+
+ const palettes = [0x51453a,0x3b414d,0x44384d,0x34453e,0x51403b];
+ const wall = palettes[n % palettes.length];
+
+ box(14,.3,18,0x292b30,0,-.2,0);
+ box(14,.3,18,0x202126,0,4.3,0);
+ box(.3,4.5,18,wall,-7,2,0);
+ box(.3,4.5,18,wall,7,2,0);
+ box(14,4.5,.3,wall,0,2,-9);
+ box(14,4.5,.3,wall,0,2,9);
+
+ for(let i=-5;i<=5;i+=2.5) {
+  box(.12,3.5,.12,0x806c55,i,1.8,-8.8);
+  box(.12,3.5,.12,0x806c55,i,1.8,8.8);
+ }
+
+ for(const pz of [-5,1,6]) {
+  const l = new THREE.PointLight(
+   n%3===0 ? 0xffd18a : 0xa9bce0, 11, 12
+  );
+  l.position.set(0,3.5,pz);
+  world.add(l);
+  box(2,.12,.6,0xe7d7b0,0,4,pz);
+ }
+
+ // Doorway and movable door panel
+ doorGroup = new THREE.Group();
+ doorGroup.position.set(0,0,-8.78);
+ world.add(doorGroup);
+ box(2.7,3.7,.25,0x111317,0,1.85,0,doorGroup);
+ doorPanel = box(2.2,3.4,.16,0x614833,0,1.8,.15,doorGroup);
+ box(.1,3.45,.2,0xc2a36b,-1.1,1.8,.08,doorGroup);
+ box(.1,3.45,.2,0xc2a36b,1.1,1.8,.08,doorGroup);
+ const knob = new THREE.Mesh(
+  new THREE.SphereGeometry(.09,10,8), material(0xd5b86d)
+ );
+ knob.position.set(.72,1.7,.05);
+ doorGroup.add(knob);
+ doorPanel.userData.open = false;
+
+ // Decorative furniture; keep a clear route through the middle.
+ let seed = (n*9301+49297)%233280;
+ const random = () => {
+  seed=(seed*9301+49297)%233280;
+  return seed/233280;
+ };
+ for(let i=0;i<5;i++) {
+  const px=(random()-.5)*10;
+  const pz=(random()-.5)*11;
+  if(Math.abs(px)>2.2 && Math.abs(pz)>1.5) {
+   box(1.1,.7,1,0x292a30,px,.35,pz);
+   box(1.2,.1,1.1,0x56412d,px,.75,pz);
+  }
+ }
+
+ // Items are scattered; flashlight is not in starting inventory.
+ if(n%4===2) {
+  const f=box(.3,.15,.55,0xe6c847,2,.15,-2);
+  f.userData.item='flashlight';
+ }
+ if(n>0 && n%7===0) {
+  const kinds=['battery','coin','bandage','vitamins','lighter','lockpick','crucifix'];
+  const obj=box(.3,.2,.3,0xd6b75a,-2,.15,1);
+  obj.userData.item=kinds[n%kinds.length];
+ }
+
+ if([10,30,60,80].includes(n)) makeEyes();
+ if([21,46].includes(n)) makeSeek();
+ if([50,100].includes(n)) makeFigure();
+}
+
+function makeEyes() {
+ eyesGroup=new THREE.Group();
+ eyesGroup.position.set(0,2.4,-6);
+ world.add(eyesGroup);
+
+ const glow=material(0x2a053c,{emissive:0x8a00dd,emissiveIntensity:2});
+ const white=material(0xffffff);
+ for(let i=0;i<7;i++) {
+  const px=(Math.random()-.5)*2.5;
+  const py=(Math.random()-.5)*1.5;
+  const eye=new THREE.Mesh(new THREE.SphereGeometry(.17,12,10),glow);
+  eye.position.set(px,py,0);
+  eyesGroup.add(eye);
+  const pupil=new THREE.Mesh(new THREE.SphereGeometry(.055,8,8),white);
+  pupil.position.set(px,py,.14);
+  eyesGroup.add(pupil);
+ }
+}
+
+function makeSeek() {
+ seekGroup=new THREE.Group();
+ seekGroup.position.set(0,1.4,-7);
+ world.add(seekGroup);
+ const body=new THREE.Mesh(
+  new THREE.SphereGeometry(.8,16,12),
+  material(0x080808,{emissive:0x111111})
+ );
+ body.scale.set(1,1.5,.55);
+ seekGroup.add(body);
+ for(let i=0;i<2;i++) {
+  const eye=new THREE.Mesh(
+   new THREE.SphereGeometry(.13,10,8),material(0xffffff)
+  );
+  eye.position.set(i?.28:-.28,.35,.4);
+  seekGroup.add(eye);
+ }
+}
+
+function makeFigure() {
+ figureGroup=new THREE.Group();
+ figureGroup.position.set(2,1.4,-5);
+ world.add(figureGroup);
+ const body=new THREE.Mesh(
+  new THREE.CapsuleGeometry(.45,1.3,4,8),material(0x171217)
+ );
+ figureGroup.add(body);
+ for(let i=0;i<2;i++) {
+  const eye=new THREE.Mesh(
+   new THREE.SphereGeometry(.09,8,8),material(0xffb44a)
+  );
+  eye.position.set(i?.18:-.18,.5,.35);
+  figureGroup.add(eye);
+ }
+}
+
+function connect() {
+ const protocol=location.protocol==='https:'?'wss:':'ws:';
+ socket=new WebSocket(protocol+'//'+location.host);
+
+ socket.onopen=()=>send({
+  type:'join',room:roomCode,name:playerName
+ });
+
+ socket.onmessage=e=>{
+  const m=JSON.parse(e.data);
+
+  if(m.type==='joined') playerId=m.id;
+  if(m.type==='state') {
+   state=m.state;
+   syncState();
+  }
+  if(m.type==='glitch') glitch();
+  if(m.type==='damage') {
+   health=m.health;
+   $('hp').textContent=health;
+  }
+  if(m.type==='item') {
+   if(!inventory.includes(m.kind)) inventory.push(m.kind);
+   renderInventory();
+  }
+  if(m.type==='objective') {
+   objectiveCount=m.count;
+   say('ЗАДАНИЕ: '+objectiveCount+'/6',1300);
+  }
+ };
+}
+
+function send(data) {
+ if(socket?.readyState===WebSocket.OPEN) {
+  socket.send(JSON.stringify(data));
+ }
+}
+
+function syncState() {
+ if(!state) return;
+ $('doorNum').textContent=state.door;
+
+ if(state.event && state.event!==eventName) {
+  eventName=state.event;
+  handleEvent(eventName);
+ }
+
+ for(const p of state.players) {
+  if(p.id===playerId) continue;
+
+  let avatar=others.get(p.id);
+  if(!avatar) {
+   avatar=new THREE.Group();
+   const body=new THREE.Mesh(
+    new THREE.CapsuleGeometry(.3,.9,4,8),
+    material(0x6297d5)
+   );
+   body.position.y=.9;
+   avatar.add(body);
+   scene.add(avatar);
+   others.set(p.id,avatar);
+  }
+  avatar.position.set(p.x,0,p.z);
+  avatar.rotation.y=p.yaw;
+ }
+
+ if(state.door>door && !transitioning) {
+  door=state.door;
+  makeRoom(door);
+  x=0; z=5;
+  camera.position.set(x,1.65,z);
+ }
+}
+
+function say(text,ms=2000) {
+ $('message').textContent=text;
+ $('message').style.opacity=1;
+ clearTimeout(say.timer);
+ say.timer=setTimeout(()=>$('message').style.opacity=0,ms);
+}
+
+function glitch() {
+ const overlay=$('glitch');
+ overlay.classList.remove('on');
+ void overlay.offsetWidth;
+ overlay.classList.add('on');
+ say('ГЛИТЧ! ВОЗВРАЩЕНИЕ В БЕЗОПАСНУЮ КОМНАТУ',1800);
+ x=0; z=5;
+ camera.position.set(x,1.65,z);
+}
+
+function handleEvent(e) {
+ const labels={
+  'elevator-open':'ЛИФТ ОТКРЫВАЕТСЯ',
+  'seek-warning':'ЧТО-ТО ПРИБЛИЖАЕТСЯ…',
+  'seek-chase-1':'SEEK — ПЕРВАЯ ПОГОНЯ! БЕГИ!',
+  'seek-chase-2':'SEEK — ВТОРАЯ ПОГОНЯ! БЕГИ!',
+  'figure-library':'FIGURE — БИБЛИОТЕКА: ИЩИ КНИГИ И КОД',
+  'figure-finale':'FIGURE — ФИНАЛЬНОЕ ИСПЫТАНИЕ',
+  'eyes':'EYES! ОТВЕРНИСЬ!',
+  'mini-complete':'ЗАДАНИЕ ВЫПОЛНЕНО!'
+ };
+ say(labels[e]||e,3500);
+ objectiveCount=0;
+
+ if(e.startsWith('seek-chase')) {
+  if(seekGroup) {
+   seekGroup.visible=true;
+   seekGroup.position.z=-7;
+  }
+  setTimeout(()=>{if(seekGroup)seekGroup.visible=false},12000);
+ }
+
+ if(e==='figure-library'||e==='figure-finale') {
+  if(figureGroup) figureGroup.visible=true;
+  setTimeout(()=>{if(figureGroup)figureGroup.visible=false},18000);
+ }
+
+ if(e==='eyes') setTimeout(checkEyes,500);
+}
+
+function checkEyes() {
+ if(!eyesGroup || !started) return;
+ const to=eyesGroup.position.clone().sub(camera.position).normalize();
+ const look=new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+ if(look.dot(to)>.75) {
+  health=Math.max(0,health-15);
+  $('hp').textContent=health;
+  send({type:'eyes-hit'});
+  say('EYES НАНОСЯТ УРОН! ОТВЕРНИСЬ!',1700);
+ }
+}
+
+function renderInventory() {
+ $('items').textContent=inventory.length?inventory.join(', '):'пока пусто';
+}
+
+function interact() {
+ if(!started || transitioning) return;
+
+ // Open the door with a visible animation before changing the room.
+ if(doorPanel && !doorPanel.userData.open) {
+  doorPanel.userData.open=true;
+  transitioning=true;
+  send({type:'door',door:door+1});
+  say('ДВЕРЬ ОТКРЫВАЕТСЯ…',700);
+
+  const panel=doorPanel;
+  const start=performance.now();
+  const animateDoor=now=>{
+   const t=Math.min(1,(now-start)/450);
+   panel.position.x=2.5*t;
+   if(t<1) requestAnimationFrame(animateDoor);
+   else {
+    door++;
+    makeRoom(door);
+    x=0; z=5;
+    camera.position.set(x,1.65,z);
+    transitioning=false;
+   }
+  };
+  requestAnimationFrame(animateDoor);
+  return;
+ }
+
+ // Raycast lets the player pick up objects by looking at them.
+ const ray=new THREE.Raycaster();
+ ray.setFromCamera(new THREE.Vector2(0,0),camera);
+ const targets=[];
+ world.traverse(o=>{
+  if(o.isMesh && o.userData.item && o.visible) targets.push(o);
+ });
+ const hits=ray.intersectObjects(targets);
+
+ if(hits.length && hits[0].distance<4) {
+  const obj=hits[0].object;
+  const kind=obj.userData.item;
+  if(!inventory.includes(kind)) inventory.push(kind);
+  renderInventory();
+  say('НАЙДЕНО: '+kind.toUpperCase());
+  obj.visible=false;
+  send({type:'item',door});
+  return;
+ }
+
+ if(state && (
+  state.event?.startsWith('seek-chase') ||
+  state.event==='figure-library' ||
+  state.event==='figure-finale'
+ )) {
+  send({type:'mini-action',event:state.event});
+  say('ПРОГРЕСС: '+(objectiveCount+1)+'/6',1000);
+ }
+}
+
+function setupTouch() {
+ if(!matchMedia('(pointer:coarse)').matches) return;
+
+ $('touch').style.display='block';
+ $('help').textContent='Левый круг — движение · Правая часть — обзор';
+
+ const stick=$('stick'),nub=$('nub');
+ let active=false,cx=0,cy=0;
+
+ stick.addEventListener('pointerdown',e=>{
+  active=true;
+  cx=e.clientX; cy=e.clientY;
+  stick.setPointerCapture(e.pointerId);
+ });
+ stick.addEventListener('pointermove',e=>{
+  if(!active)return;
+  let dx=e.clientX-cx,dy=e.clientY-cy;
+  const len=Math.hypot(dx,dy),k=Math.min(1,48/(len||1));
+  dx*=k;dy*=k;
+  nub.style.transform=`translate(${dx}px,${dy}px)`;
+  sideways=dx/48;
+  forward=-dy/48;
+ });
+ function stop(){
+  active=false;forward=0;sideways=0;
+  nub.style.transform='';
+ }
+ stick.addEventListener('pointerup',stop);
+ stick.addEventListener('pointercancel',stop);
+
+ const look=$('look');
+ let lx=0,ly=0,looking=false;
+ look.addEventListener('pointerdown',e=>{
+  lx=e.clientX;ly=e.clientY;looking=true;
+  look.setPointerCapture(e.pointerId);
+ });
+ look.addEventListener('pointermove',e=>{
+  if(!looking)return;
+  const dx=e.clientX-lx,dy=e.clientY-ly;
+  lx=e.clientX;ly=e.clientY;
+  yaw-=dx*.008;
+  pitch=Math.max(-1.15,Math.min(1.15,pitch-dy*.008));
+ });
+ look.addEventListener('pointerup',()=>looking=false);
+ look.addEventListener('pointercancel',()=>looking=false);
+ $('interact').onclick=interact;
+}
+
+function animate() {
+ requestAnimationFrame(animate);
+ if(!renderer)return;
+
+ if(started) {
+  const direction=new THREE.Vector3(sideways,0,-forward);
+  if(direction.length()>1)direction.normalize();
+  direction.applyAxisAngle(new THREE.Vector3(0,1,0),yaw);
+
+  x+=direction.x*.075;
+  z+=direction.z*.075;
+
+  // Recover only when outside the actual room boundaries.
+  if(Math.abs(x)>9 || z>12 || z < -12) {
+   glitch();
+   send({type:'move',x:0,z:5,yaw,door,hide:false});
+  }
+
+  camera.position.set(x,hiding?1.0:1.65,z);
+  camera.rotation.set(pitch,yaw,0,'YXZ');
+
+  if(seekGroup?.visible) {
+   seekGroup.position.z+=.018;
+   if(seekGroup.position.z>z+1) {
+    health=Math.max(0,health-25);
+    $('hp').textContent=health;
+    seekGroup.position.z=-7;
+    say('SEEK ЗАДЕЛ ТЕБЯ!',1200);
+   }
+  }
+
+  if(figureGroup?.visible) {
+   figureGroup.position.x+=(x-figureGroup.position.x)*.001;
+   figureGroup.position.z+=(z-figureGroup.position.z)*.001;
+  }
+
+  const now=Date.now();
+  if(now-lastSent>100) {
+   lastSent=now;
+   send({type:'move',x,z,yaw,door,hide:hiding});
+  }
+ }
+ renderer.render(scene,camera);
+}
+
+$('solo').onclick=$('coop').onclick=()=>{
+ playerName=$('name').value.trim()||'Player';
+ roomCode=($('room').value.trim()||'HALL')
+  .toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,8)||'HALL';
+ $('menu').style.display='none';
+ started=true;
+ connect();
+ send({type:'start'});
+};
+
+$('interact').onclick=interact;
+init();
+</script>
+</body>
+  </html>
